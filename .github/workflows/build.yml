@@ -1,0 +1,996 @@
+name: Build FrameGen APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Create project files
+        run: |
+          set -e
+          mkdir -p app/src/main/java/com/framegen app/src/main/res/xml app/src/main/res/values
+          cat > settings.gradle.kts <<'FG_EOF_0'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "FrameGen"
+          include(":app")
+          FG_EOF_0
+          cat > build.gradle.kts <<'FG_EOF_1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          FG_EOF_1
+          cat > gradle.properties <<'FG_EOF_2'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          FG_EOF_2
+          cat > app/build.gradle.kts <<'FG_EOF_3'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.framegen"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.framegen"
+                  minSdk = 33
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          FG_EOF_3
+          cat > app/src/main/AndroidManifest.xml <<'FG_EOF_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+
+              <application
+                  android:label="FrameGen"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".FrameGenService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+
+                  <service
+                      android:name=".OverlayAccessibilityService"
+                      android:exported="true"
+                      android:label="FrameGen overlay"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          FG_EOF_4
+          cat > app/src/main/res/values/strings.xml <<'FG_EOF_5'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="a11y_description">Lets FrameGen draw the smoothed game picture on top of the screen. It does not read any screen content.</string>
+          </resources>
+          FG_EOF_5
+          cat > app/src/main/res/xml/accessibility_config.xml <<'FG_EOF_6'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/a11y_description"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canRetrieveWindowContent="false"
+              android:notificationTimeout="200" />
+          FG_EOF_6
+          cat > app/src/main/java/com/framegen/OverlayAccessibilityService.kt <<'FG_EOF_7'
+          package com.framegen
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Intent
+          import android.view.accessibility.AccessibilityEvent
+
+          /**
+           * Only exists so we can create a TYPE_ACCESSIBILITY_OVERLAY window.
+           * Android lets touches pass through such windows even when they are fully opaque,
+           * which a normal overlay (SYSTEM_ALERT_WINDOW) does not on Android 12+.
+           */
+          class OverlayAccessibilityService : AccessibilityService() {
+              companion object {
+                  @Volatile var instance: OverlayAccessibilityService? = null
+              }
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  instance = this
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+          }
+          FG_EOF_7
+          cat > app/src/main/java/com/framegen/FramePipeline.kt <<'FG_EOF_8'
+          package com.framegen
+
+          import android.graphics.SurfaceTexture
+          import android.opengl.EGL14
+          import android.opengl.EGLConfig
+          import android.opengl.EGLContext
+          import android.opengl.EGLDisplay
+          import android.opengl.EGLSurface
+          import android.opengl.GLES11Ext
+          import android.opengl.GLES20
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.os.SystemClock
+          import android.util.Log
+          import android.view.Surface
+          import java.util.concurrent.CountDownLatch
+          import java.util.concurrent.TimeUnit
+          import kotlin.math.floor
+          import kotlin.math.max
+          import kotlin.math.min
+
+          /**
+           * Receives captured game frames (via a SurfaceTexture), estimates motion between the
+           * last two frames on the GPU (block matching), and draws in-between frames onto the
+           * overlay surface at evenly spaced times.
+           */
+          class FramePipeline(
+              private val outSurface: Surface,
+              private val outW: Int,
+              private val outH: Int,
+              private val capW: Int,
+              private val capH: Int,
+              private val multiplier: Int,
+              private val refreshHz: () -> Float,
+              private val onCaptureSurface: (Surface) -> Unit
+          ) {
+              private val tag = "FrameGen"
+              private val thread = HandlerThread("framegen-gl").apply { start() }
+              private val handler = Handler(thread.looper)
+              private val token = Any()
+
+              private var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
+              private var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
+              private var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
+
+              private var oesTex = 0
+              private var st: SurfaceTexture? = null
+              private var capSurface: Surface? = null
+              private val tex = IntArray(2)
+              private val fbo = IntArray(2)
+              private var mvTex = 0
+              private var mvFbo = 0
+              private var mw = 0
+              private var mh = 0
+              private var cur = 0
+
+              private var pCopy = 0
+              private var pMotion = 0
+              private var pInterp = 0
+              private var pBlit = 0
+
+              private val stMat = FloatArray(16)
+              private var lastTs = -1L
+              private var lastFrameMs = 0L
+              private var dt = 33f
+              private var lastInterval = 0f
+              private var frames = 0
+              private var active = false
+              @Volatile private var released = false
+
+              fun start() {
+                  handler.post {
+                      try {
+                          init()
+                      } catch (t: Throwable) {
+                          Log.e(tag, "init failed", t)
+                      }
+                  }
+              }
+
+              fun stop() {
+                  if (released) return
+                  released = true
+                  val latch = CountDownLatch(1)
+                  handler.post {
+                      try { release() } catch (t: Throwable) { Log.e(tag, "release failed", t) }
+                      latch.countDown()
+                  }
+                  latch.await(700, TimeUnit.MILLISECONDS)
+                  thread.quitSafely()
+              }
+
+              // ---------------------------------------------------------------- setup
+
+              private fun init() {
+                  initEgl()
+                  pCopy = program(FS_COPY)
+                  pMotion = program(FS_MOTION)
+                  pInterp = program(FS_INTERP)
+                  pBlit = program(FS_BLIT)
+
+                  for (i in 0..1) {
+                      tex[i] = makeTex(capW, capH, GLES20.GL_LINEAR)
+                      fbo[i] = makeFbo(tex[i])
+                  }
+                  mw = (capW + 7) / 8
+                  mh = (capH + 7) / 8
+                  mvTex = makeTex(mw, mh, GLES20.GL_NEAREST)
+                  mvFbo = makeFbo(mvTex)
+
+                  val ids = IntArray(1)
+                  GLES20.glGenTextures(1, ids, 0)
+                  oesTex = ids[0]
+                  GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTex)
+                  GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+                  GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+                  GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+                  GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+
+                  val s = SurfaceTexture(oesTex)
+                  s.setDefaultBufferSize(capW, capH)
+                  s.setOnFrameAvailableListener({ if (!released) onFrame() }, handler)
+                  st = s
+                  val cs = Surface(s)
+                  capSurface = cs
+
+                  clearOverlay()
+                  handler.postDelayed(idleCheck, 300)
+                  onCaptureSurface(cs)
+              }
+
+              private fun initEgl() {
+                  eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+                  val ver = IntArray(2)
+                  EGL14.eglInitialize(eglDisplay, ver, 0, ver, 1)
+                  val cfgAttr = intArrayOf(
+                      EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8,
+                      EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
+                      EGL14.EGL_RENDERABLE_TYPE, 0x0040, // EGL_OPENGL_ES3_BIT_KHR
+                      EGL14.EGL_NONE
+                  )
+                  val configs = arrayOfNulls<EGLConfig>(1)
+                  val n = IntArray(1)
+                  EGL14.eglChooseConfig(eglDisplay, cfgAttr, 0, configs, 0, 1, n, 0)
+                  val ctxAttr = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE)
+                  eglContext = EGL14.eglCreateContext(eglDisplay, configs[0], EGL14.EGL_NO_CONTEXT, ctxAttr, 0)
+                  eglSurface = EGL14.eglCreateWindowSurface(eglDisplay, configs[0], outSurface, intArrayOf(EGL14.EGL_NONE), 0)
+                  EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+                  EGL14.eglSwapInterval(eglDisplay, 1)
+              }
+
+              private fun release() {
+                  handler.removeCallbacksAndMessages(null)
+                  st?.setOnFrameAvailableListener(null)
+                  st?.release()
+                  capSurface?.release()
+                  if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
+                      EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+                      EGL14.eglDestroySurface(eglDisplay, eglSurface)
+                      EGL14.eglDestroyContext(eglDisplay, eglContext)
+                      EGL14.eglTerminate(eglDisplay)
+                  }
+                  eglDisplay = EGL14.EGL_NO_DISPLAY
+              }
+
+              // ---------------------------------------------------------------- frames
+
+              private fun onFrame() {
+                  val s = st ?: return
+                  s.updateTexImage()
+                  val ts = s.timestamp
+                  if (ts == lastTs) return
+                  lastTs = ts
+                  s.getTransformMatrix(stMat)
+
+                  val now = SystemClock.uptimeMillis()
+                  val interval = (now - lastFrameMs).toFloat()
+                  lastFrameMs = now
+                  lastInterval = interval
+                  if (interval in 5f..120f) dt = if (frames < 2) interval else dt * 0.7f + interval * 0.3f
+                  active = true
+
+                  handler.removeCallbacksAndMessages(token)
+                  cur = 1 - cur
+                  copyToCur()
+                  frames++
+
+                  // How many frames can we really show per captured frame on this display?
+                  val hz = refreshHz()
+                  val fit = floor(hz * dt / 1000f + 0.15f).toInt()
+                  var m = min(multiplier, max(1, fit))
+                  if (frames < 2 || interval > 150f) m = 1
+
+                  if (m <= 1) {
+                      presentBlit()
+                      return
+                  }
+                  runMotion()
+                  for (k in 1..m) {
+                      val delay = ((k - 1) * dt / m).toLong()
+                      if (delay <= 0L) {
+                          presentStep(k, m)
+                      } else {
+                          handler.postAtTime({ if (!released) presentStep(k, m) }, token, now + delay)
+                      }
+                  }
+              }
+
+              private val idleCheck = object : Runnable {
+                  override fun run() {
+                      if (released) return
+                      if (active && SystemClock.uptimeMillis() - lastFrameMs > 700) {
+                          active = false
+                          handler.removeCallbacksAndMessages(token)
+                          clearOverlay()
+                      }
+                      handler.postDelayed(this, 250)
+                  }
+              }
+
+              private fun presentStep(k: Int, m: Int) {
+                  if (k >= m) presentBlit() else presentInterp(k.toFloat() / m)
+              }
+
+              // ---------------------------------------------------------------- GL passes
+
+              private fun copyToCur() {
+                  GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo[cur])
+                  GLES20.glViewport(0, 0, capW, capH)
+                  GLES20.glUseProgram(pCopy)
+                  bind(0, GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTex)
+                  GLES20.glUniform1i(loc(pCopy, "tex"), 0)
+                  GLES20.glUniformMatrix4fv(loc(pCopy, "stm"), 1, false, stMat, 0)
+                  draw()
+              }
+
+              private fun runMotion() {
+                  GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, mvFbo)
+                  GLES20.glViewport(0, 0, mw, mh)
+                  GLES20.glUseProgram(pMotion)
+                  bind(0, GLES20.GL_TEXTURE_2D, tex[cur])
+                  bind(1, GLES20.GL_TEXTURE_2D, tex[1 - cur])
+                  GLES20.glUniform1i(loc(pMotion, "curT"), 0)
+                  GLES20.glUniform1i(loc(pMotion, "prevT"), 1)
+                  GLES20.glUniform2f(loc(pMotion, "texel"), 1f / capW, 1f / capH)
+                  draw()
+              }
+
+              private fun presentInterp(t: Float) {
+                  GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                  GLES20.glViewport(0, 0, outW, outH)
+                  GLES20.glUseProgram(pInterp)
+                  bind(0, GLES20.GL_TEXTURE_2D, tex[cur])
+                  bind(1, GLES20.GL_TEXTURE_2D, tex[1 - cur])
+                  bind(2, GLES20.GL_TEXTURE_2D, mvTex)
+                  GLES20.glUniform1i(loc(pInterp, "curT"), 0)
+                  GLES20.glUniform1i(loc(pInterp, "prevT"), 1)
+                  GLES20.glUniform1i(loc(pInterp, "mvT"), 2)
+                  GLES20.glUniform2f(loc(pInterp, "texel"), 1f / capW, 1f / capH)
+                  GLES20.glUniform2f(loc(pInterp, "mvScale"), capW / 8f / mw, capH / 8f / mh)
+                  GLES20.glUniform1f(loc(pInterp, "t"), t)
+                  draw()
+                  EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+              }
+
+              private fun presentBlit() {
+                  GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                  GLES20.glViewport(0, 0, outW, outH)
+                  GLES20.glUseProgram(pBlit)
+                  bind(0, GLES20.GL_TEXTURE_2D, tex[cur])
+                  GLES20.glUniform1i(loc(pBlit, "tex"), 0)
+                  draw()
+                  EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+              }
+
+              private fun clearOverlay() {
+                  GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                  GLES20.glViewport(0, 0, outW, outH)
+                  GLES20.glClearColor(0f, 0f, 0f, 0f)
+                  GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                  EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+              }
+
+              // ---------------------------------------------------------------- GL helpers
+
+              private fun draw() = GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 3)
+
+              private fun bind(unit: Int, target: Int, id: Int) {
+                  GLES20.glActiveTexture(GLES20.GL_TEXTURE0 + unit)
+                  GLES20.glBindTexture(target, id)
+              }
+
+              private fun loc(p: Int, name: String) = GLES20.glGetUniformLocation(p, name)
+
+              private fun makeTex(w: Int, h: Int, filter: Int): Int {
+                  val id = IntArray(1)
+                  GLES20.glGenTextures(1, id, 0)
+                  GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, id[0])
+                  GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, w, h, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
+                  GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, filter)
+                  GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, filter)
+                  GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+                  GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+                  return id[0]
+              }
+
+              private fun makeFbo(texId: Int): Int {
+                  val id = IntArray(1)
+                  GLES20.glGenFramebuffers(1, id, 0)
+                  GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, id[0])
+                  GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, texId, 0)
+                  return id[0]
+              }
+
+              private fun shader(type: Int, src: String): Int {
+                  val s = GLES20.glCreateShader(type)
+                  GLES20.glShaderSource(s, src)
+                  GLES20.glCompileShader(s)
+                  val ok = IntArray(1)
+                  GLES20.glGetShaderiv(s, GLES20.GL_COMPILE_STATUS, ok, 0)
+                  if (ok[0] == 0) throw RuntimeException("Shader error: " + GLES20.glGetShaderInfoLog(s))
+                  return s
+              }
+
+              private fun program(fs: String): Int {
+                  val p = GLES20.glCreateProgram()
+                  GLES20.glAttachShader(p, shader(GLES20.GL_VERTEX_SHADER, VS))
+                  GLES20.glAttachShader(p, shader(GLES20.GL_FRAGMENT_SHADER, fs))
+                  GLES20.glLinkProgram(p)
+                  val ok = IntArray(1)
+                  GLES20.glGetProgramiv(p, GLES20.GL_LINK_STATUS, ok, 0)
+                  if (ok[0] == 0) throw RuntimeException("Link error: " + GLES20.glGetProgramInfoLog(p))
+                  return p
+              }
+
+              companion object {
+                  private const val VS = """#version 300 es
+          out vec2 uv;
+          void main() {
+              vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+              uv = p;
+              gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+          }
+          """
+
+                  private const val FS_COPY = """#version 300 es
+          #extension GL_OES_EGL_image_external_essl3 : require
+          precision highp float;
+          uniform samplerExternalOES tex;
+          uniform mat4 stm;
+          in vec2 uv;
+          out vec4 o;
+          void main() {
+              o = vec4(texture(tex, (stm * vec4(uv, 0.0, 1.0)).xy).rgb, 1.0);
+          }
+          """
+
+                  private const val FS_BLIT = """#version 300 es
+          precision highp float;
+          uniform sampler2D tex;
+          in vec2 uv;
+          out vec4 o;
+          void main() {
+              o = vec4(texture(tex, uv).rgb, 1.0);
+          }
+          """
+
+                  // One output texel = one 8x8 block. Finds where the block of the current frame
+                  // was in the previous frame. Stores offset in rg and match error in b.
+                  private const val FS_MOTION = """#version 300 es
+          precision highp float;
+          uniform sampler2D curT;
+          uniform sampler2D prevT;
+          uniform vec2 texel;
+          out vec4 o;
+
+          float lum(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+          float sadAt(vec2 base, vec2 off) {
+              float s = 0.0;
+              for (int y = 0; y < 4; y++) {
+                  for (int x = 0; x < 4; x++) {
+                      vec2 p = base + vec2(float(x) * 2.0 + 1.0, float(y) * 2.0 + 1.0) * texel;
+                      s += abs(lum(texture(curT, p).rgb) - lum(texture(prevT, p + off * texel).rgb));
+                  }
+              }
+              return s / 16.0;
+          }
+
+          void main() {
+              vec2 base = floor(gl_FragCoord.xy) * 8.0 * texel;
+              float best = sadAt(base, vec2(0.0));
+              vec2 bo = vec2(0.0);
+              if (best > 0.01) {
+                  for (int j = -4; j <= 4; j++) {
+                      for (int i = -4; i <= 4; i++) {
+                          if (i == 0 && j == 0) continue;
+                          vec2 off = vec2(float(i), float(j)) * 4.0;
+                          float s = sadAt(base, off) + 0.0004 * length(off);
+                          if (s < best) { best = s; bo = off; }
+                      }
+                  }
+                  vec2 c = bo;
+                  for (int j = -3; j <= 3; j++) {
+                      for (int i = -3; i <= 3; i++) {
+                          if (i == 0 && j == 0) continue;
+                          vec2 off = c + vec2(float(i), float(j));
+                          float s = sadAt(base, off) + 0.0004 * length(off);
+                          if (s < best) { best = s; bo = off; }
+                      }
+                  }
+              }
+              o = vec4(bo / 64.0 + 0.5, clamp(best * 4.0, 0.0, 1.0), 1.0);
+          }
+          """
+
+                  private const val FS_INTERP = """#version 300 es
+          precision highp float;
+          uniform sampler2D curT;
+          uniform sampler2D prevT;
+          uniform sampler2D mvT;
+          uniform vec2 texel;
+          uniform vec2 mvScale;
+          uniform float t;
+          in vec2 uv;
+          out vec4 o;
+
+          void main() {
+              vec4 m = texture(mvT, uv * mvScale);
+              vec2 off = m.rg * 64.0 - 32.0;
+              float conf = m.b;
+              vec3 a = texture(prevT, uv + off * texel * t).rgb;
+              vec3 b = texture(curT, uv - off * texel * (1.0 - t)).rgb;
+              vec3 interp = mix(a, b, t);
+              vec3 fb = (t < 0.5) ? texture(prevT, uv).rgb : texture(curT, uv).rgb;
+              o = vec4(mix(interp, fb, smoothstep(0.12, 0.30, conf)), 1.0);
+          }
+          """
+              }
+          }
+          FG_EOF_8
+          cat > app/src/main/java/com/framegen/FrameGenService.kt <<'FG_EOF_9'
+          package com.framegen
+
+          import android.app.Activity
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.Icon
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.view.Display
+          import android.view.Gravity
+          import android.view.Surface
+          import android.view.SurfaceHolder
+          import android.view.SurfaceView
+          import android.view.WindowManager
+          import android.widget.Toast
+          import kotlin.math.max
+
+          class FrameGenService : Service() {
+
+              companion object {
+                  const val ACTION_STOP = "com.framegen.STOP"
+                  private const val CHANNEL = "framegen"
+                  @Volatile var running = false
+              }
+
+              private val main = Handler(Looper.getMainLooper())
+              private var projection: MediaProjection? = null
+              private var virtualDisplay: VirtualDisplay? = null
+              private var pipeline: FramePipeline? = null
+              private var pipelineHolder: SurfaceHolder? = null
+              private var overlay: SurfaceView? = null
+              private var multiplier = 2
+              private var scale = 0.5f
+              private var lastW = 0
+              private var lastH = 0
+              private var displayListener: DisplayManager.DisplayListener? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent == null || intent.action == ACTION_STOP) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  // Must go to the foreground right away, before anything else.
+                  startAsForeground()
+                  if (running) return START_NOT_STICKY
+
+                  if (OverlayAccessibilityService.instance == null) {
+                      Toast.makeText(this, "Turn on the FrameGen accessibility service first", Toast.LENGTH_LONG).show()
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+
+                  multiplier = intent.getIntExtra("mult", 2)
+                  scale = intent.getFloatExtra("scale", 0.5f)
+                  val code = intent.getIntExtra("code", Activity.RESULT_CANCELED)
+                  val data = intent.getParcelableExtra("data", Intent::class.java)
+                  if (data == null) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+
+                  try {
+                      val mpm = getSystemService(MediaProjectionManager::class.java)
+                      val p = mpm.getMediaProjection(code, data)
+                      p.registerCallback(object : MediaProjection.Callback() {
+                          override fun onStop() {
+                              main.post { stopSelf() }
+                          }
+                      }, main)
+                      projection = p
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Could not start capture: " + e.message, Toast.LENGTH_LONG).show()
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+
+                  running = true
+                  val dmgr = getSystemService(DisplayManager::class.java)
+                  val l = object : DisplayManager.DisplayListener {
+                      override fun onDisplayAdded(displayId: Int) {}
+                      override fun onDisplayRemoved(displayId: Int) {}
+                      override fun onDisplayChanged(displayId: Int) {
+                          if (displayId == Display.DEFAULT_DISPLAY) main.post { checkSize() }
+                      }
+                  }
+                  displayListener = l
+                  dmgr.registerDisplayListener(l, main)
+
+                  buildOverlay()
+                  return START_NOT_STICKY
+              }
+
+              private fun startAsForeground() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel(CHANNEL, "FrameGen", NotificationManager.IMPORTANCE_LOW))
+                  val stop = PendingIntent.getService(
+                      this, 0,
+                      Intent(this, FrameGenService::class.java).setAction(ACTION_STOP),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  val n = Notification.Builder(this, CHANNEL)
+                      .setContentTitle("FrameGen is running")
+                      .setContentText("Tap Stop to turn frame generation off")
+                      .setSmallIcon(android.R.drawable.ic_media_play)
+                      .addAction(Notification.Action.Builder(Icon.createWithResource(this, android.R.drawable.ic_delete), "Stop", stop).build())
+                      .setOngoing(true)
+                      .build()
+                  startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+              }
+
+              private fun windowManager(): WindowManager? =
+                  OverlayAccessibilityService.instance?.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+
+              private fun checkSize() {
+                  val b = windowManager()?.maximumWindowMetrics?.bounds ?: return
+                  if (b.width() != lastW || b.height() != lastH) rebuild()
+              }
+
+              private fun rebuild() {
+                  stopPipeline()
+                  removeOverlay()
+                  buildOverlay()
+              }
+
+              private fun buildOverlay() {
+                  val a11y = OverlayAccessibilityService.instance ?: return
+                  val wm = windowManager() ?: return
+                  val b = wm.maximumWindowMetrics.bounds
+                  lastW = b.width()
+                  lastH = b.height()
+
+                  val sv = SurfaceView(a11y)
+                  sv.setZOrderOnTop(true)
+                  sv.holder.setFormat(PixelFormat.TRANSLUCENT)
+                  sv.holder.addCallback(object : SurfaceHolder.Callback {
+                      override fun surfaceCreated(holder: SurfaceHolder) {}
+                      override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {
+                          if (pipelineHolder !== holder && w > 0 && h > 0) startPipeline(holder, w, h)
+                      }
+                      override fun surfaceDestroyed(holder: SurfaceHolder) {
+                          if (pipelineHolder === holder) stopPipeline()
+                      }
+                  })
+
+                  val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                      WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                      WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                  val lp = WindowManager.LayoutParams(
+                      b.width(), b.height(),
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      flags, PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                  try {
+                      wm.addView(sv, lp)
+                      overlay = sv
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Overlay failed: " + e.message, Toast.LENGTH_LONG).show()
+                      stopSelf()
+                  }
+              }
+
+              private fun removeOverlay() {
+                  val v = overlay ?: return
+                  overlay = null
+                  try { windowManager()?.removeView(v) } catch (_: Exception) {}
+              }
+
+              private fun startPipeline(holder: SurfaceHolder, w: Int, h: Int) {
+                  pipelineHolder = holder
+                  val cw = max(64, (lastW * scale).toInt() / 2 * 2)
+                  val ch = max(64, (lastH * scale).toInt() / 2 * 2)
+                  val hz = {
+                      getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY)?.refreshRate ?: 60f
+                  }
+                  val p = FramePipeline(holder.surface, w, h, cw, ch, multiplier, hz) { cap ->
+                      main.post { attachCapture(cap, cw, ch) }
+                  }
+                  pipeline = p
+                  p.start()
+              }
+
+              private fun attachCapture(s: Surface, w: Int, h: Int) {
+                  val p = projection ?: return
+                  if (pipeline == null) return
+                  val dpi = resources.displayMetrics.densityDpi
+                  try {
+                      val vd = virtualDisplay
+                      if (vd == null) {
+                          virtualDisplay = p.createVirtualDisplay(
+                              "framegen", w, h, dpi,
+                              DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, s, null, null
+                          )
+                      } else {
+                          vd.resize(w, h, dpi)
+                          vd.surface = s
+                      }
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Capture failed: " + e.message, Toast.LENGTH_LONG).show()
+                      stopSelf()
+                  }
+              }
+
+              private fun stopPipeline() {
+                  try { virtualDisplay?.surface = null } catch (_: Exception) {}
+                  val p = pipeline
+                  pipeline = null
+                  pipelineHolder = null
+                  p?.stop()
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  displayListener?.let { getSystemService(DisplayManager::class.java).unregisterDisplayListener(it) }
+                  displayListener = null
+                  stopPipeline()
+                  removeOverlay()
+                  try { virtualDisplay?.release() } catch (_: Exception) {}
+                  virtualDisplay = null
+                  try { projection?.stop() } catch (_: Exception) {}
+                  projection = null
+                  super.onDestroy()
+              }
+          }
+          FG_EOF_9
+          cat > app/src/main/java/com/framegen/MainActivity.kt <<'FG_EOF_10'
+          package com.framegen
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.View
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.RadioButton
+          import android.widget.RadioGroup
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private var multiplier = 2
+              private var scale = 0.5f
+              private lateinit var status: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(pad, pad, pad, pad)
+
+                  fun label(s: String, size: Float = 15f): TextView {
+                      val t = TextView(this)
+                      t.text = s
+                      t.textSize = size
+                      t.setPadding(0, pad / 2, 0, pad / 2)
+                      return t
+                  }
+
+                  root.addView(label("FrameGen", 30f))
+                  root.addView(label("Makes games look smoother by creating extra frames between the real ones. Works on top of any game."))
+                  status = label("")
+                  root.addView(status)
+
+                  root.addView(label("Frames per real frame", 17f))
+                  root.addView(radios(listOf("2x", "3x", "4x"), 0) { multiplier = it + 2 })
+
+                  root.addView(label("Quality / speed", 17f))
+                  root.addView(radios(listOf("Sharp", "Balanced", "Fast"), 1) {
+                      scale = when (it) { 0 -> 0.75f; 1 -> 0.5f; else -> 0.35f }
+                  })
+
+                  val setup = Button(this)
+                  setup.text = "1. Turn on overlay service"
+                  setup.setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  root.addView(setup)
+
+                  val start = Button(this)
+                  start.text = "2. Start"
+                  start.setOnClickListener { onStart() }
+                  root.addView(start)
+
+                  val stop = Button(this)
+                  stop.text = "Stop"
+                  stop.setOnClickListener {
+                      startService(Intent(this, FrameGenService::class.java).setAction(FrameGenService.ACTION_STOP))
+                      updateStatus()
+                  }
+                  root.addView(stop)
+
+                  root.addView(label(
+                      "How to use:\n" +
+                      "1. Open the game first, then come back here.\n" +
+                      "2. Tap Start. In the Android prompt choose 'Share one app' (NOT 'Entire screen') and pick your game.\n" +
+                      "3. Switch to the game. Smoothed frames appear on top.\n\n" +
+                      "Best when the game runs at 30 FPS on a 60/90/120 Hz screen. If the game already fills your screen's refresh rate there is nothing to add, so the tool passes frames straight through."
+                  ))
+
+                  setContentView(ScrollView(this).also { it.addView(root) })
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  updateStatus()
+              }
+
+              private fun updateStatus() {
+                  val a = OverlayAccessibilityService.instance != null
+                  status.text = "Overlay service: " + (if (a) "ON" else "OFF - tap button 1") +
+                      "\nFrame generation: " + (if (FrameGenService.running) "RUNNING" else "stopped")
+              }
+
+              private fun radios(options: List<String>, selected: Int, onPick: (Int) -> Unit): RadioGroup {
+                  val g = RadioGroup(this)
+                  g.orientation = RadioGroup.HORIZONTAL
+                  val ids = ArrayList<Int>()
+                  options.forEachIndexed { i, s ->
+                      val rb = RadioButton(this)
+                      rb.text = s
+                      rb.id = View.generateViewId()
+                      ids.add(rb.id)
+                      g.addView(rb)
+                      if (i == selected) g.check(rb.id)
+                  }
+                  g.setOnCheckedChangeListener { _, id -> onPick(ids.indexOf(id)) }
+                  return g
+              }
+
+              private fun onStart() {
+                  if (OverlayAccessibilityService.instance == null) {
+                      Toast.makeText(this, "Turn on the FrameGen overlay service first", Toast.LENGTH_LONG).show()
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                      return
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+                  val mpm = getSystemService(MediaProjectionManager::class.java)
+                  startActivityForResult(mpm.createScreenCaptureIntent(), 100)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == 100 && resultCode == RESULT_OK && data != null) {
+                      val i = Intent(this, FrameGenService::class.java)
+                      i.putExtra("code", resultCode)
+                      i.putExtra("data", data)
+                      i.putExtra("mult", multiplier)
+                      i.putExtra("scale", scale)
+                      startForegroundService(i)
+                      Toast.makeText(this, "Started. Switch to your game now.", Toast.LENGTH_LONG).show()
+                      moveTaskToBack(true)
+                  }
+              }
+          }
+          FG_EOF_10
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FrameGen-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
