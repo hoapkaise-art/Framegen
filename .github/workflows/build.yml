@@ -998,3 +998,78 @@ jobs:
                       "How to use:\n" +
                       "1. Open the game first, then come back here.\n" +
                       "2. Tap Start. In the Android prompt choose 'Share one app' (NOT 'Entire screen') and pick your game.\n" +
+                      "3. Switch to the game. Smoothed frames appear on top.\n\n" +
+                      "Best when the game runs at 30 FPS on a 60/90/120 Hz screen. If the game already fills your screen's refresh rate there is nothing to add, so the tool passes frames straight through."
+                  ))
+
+                  setContentView(ScrollView(this).also { it.addView(root) })
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  updateStatus()
+              }
+
+              private fun updateStatus() {
+                  val a = OverlayAccessibilityService.instance != null
+                  status.text = "Overlay service: " + (if (a) "ON" else "OFF - tap button 1") +
+                      "\nFrame generation: " + (if (FrameGenService.running) "RUNNING" else "stopped")
+              }
+
+              private fun radios(options: List<String>, selected: Int, onPick: (Int) -> Unit): RadioGroup {
+                  val g = RadioGroup(this)
+                  g.orientation = RadioGroup.HORIZONTAL
+                  val ids = ArrayList<Int>()
+                  options.forEachIndexed { i, s ->
+                      val rb = RadioButton(this)
+                      rb.text = s
+                      rb.id = View.generateViewId()
+                      ids.add(rb.id)
+                      g.addView(rb)
+                      if (i == selected) g.check(rb.id)
+                  }
+                  g.setOnCheckedChangeListener { _, id -> onPick(ids.indexOf(id)) }
+                  return g
+              }
+
+              private fun startCaptureFlow() {
+                  if (OverlayAccessibilityService.instance == null) {
+                      Toast.makeText(this, "Turn on the FrameGen overlay service first", Toast.LENGTH_LONG).show()
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                      return
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+                  val mpm = getSystemService(MediaProjectionManager::class.java)
+                  startActivityForResult(mpm.createScreenCaptureIntent(), 100)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == 100 && resultCode == RESULT_OK && data != null) {
+                      val i = Intent(this, FrameGenService::class.java)
+                      i.putExtra("code", resultCode)
+                      i.putExtra("data", data)
+                      i.putExtra("mult", multiplier)
+                      i.putExtra("scale", scale)
+                      i.putExtra("fps", showFps)
+                      startForegroundService(i)
+                      Toast.makeText(this, "Started. Switch to your game now.", Toast.LENGTH_LONG).show()
+                      moveTaskToBack(true)
+                  }
+              }
+          }
+          FG_EOF_10
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FrameGen-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
