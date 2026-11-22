@@ -905,7 +905,7 @@ jobs:
 
                   val start = Button(this)
                   start.text = "2. Start"
-                  start.setOnClickListener { onStart() }
+                  start.setOnClickListener { startCaptureFlow() }
                   root.addView(start)
 
                   val stop = Button(this)
@@ -954,7 +954,7 @@ jobs:
                   return g
               }
 
-              private fun onStart() {
+              private fun startCaptureFlow() {
                   if (OverlayAccessibilityService.instance == null) {
                       Toast.makeText(this, "Turn on the FrameGen overlay service first", Toast.LENGTH_LONG).show()
                       startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
