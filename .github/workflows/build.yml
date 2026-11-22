@@ -193,6 +193,7 @@ jobs:
               private val capW: Int,
               private val capH: Int,
               private val multiplier: Int,
+              private val maxHz: Float,
               private val refreshHz: () -> Float,
               private val onStats: ((Float, Float) -> Unit)?,
               private val onCaptureSurface: (Surface) -> Unit
@@ -261,6 +262,12 @@ jobs:
               // ---------------------------------------------------------------- setup
 
               private fun init() {
+                  try {
+                      // Request the display's highest supported refresh rate for this overlay.
+                      outSurface.setFrameRate(maxHz, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
+                  } catch (t: Throwable) {
+                      Log.w(tag, "setFrameRate failed", t)
+                  }
                   initEgl()
                   pCopy = program(FS_COPY)
                   pMotion = program(FS_MOTION)
@@ -758,6 +765,11 @@ jobs:
               private fun windowManager(): WindowManager? =
                   OverlayAccessibilityService.instance?.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
 
+              private fun maxRefreshRate(): Float {
+                  val d = getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY)
+                  return d?.supportedModes?.maxOfOrNull { it.refreshRate } ?: 60f
+              }
+
               private fun checkSize() {
                   val b = windowManager()?.maximumWindowMetrics?.bounds ?: return
                   if (b.width() != lastW || b.height() != lastH) rebuild()
@@ -801,6 +813,7 @@ jobs:
                   )
                   lp.gravity = Gravity.TOP or Gravity.START
                   lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                  lp.preferredRefreshRate = maxRefreshRate()
                   try {
                       wm.addView(sv, lp)
                       overlay = sv
@@ -842,7 +855,9 @@ jobs:
                   if (inFps < 1f) {
                       tv.visibility = View.INVISIBLE
                   } else {
-                      tv.text = String.format("Game %.0f  \u2192  Smooth %.0f FPS", inFps, outFps)
+                      val hz = getSystemService(DisplayManager::class.java)
+                          .getDisplay(Display.DEFAULT_DISPLAY)?.refreshRate ?: 0f
+                      tv.text = String.format("Game %.0f  \u2192  Smooth %.0f FPS  |  Screen %.0f Hz", inFps, outFps, hz)
                       tv.visibility = View.VISIBLE
                   }
               }
@@ -864,7 +879,7 @@ jobs:
                       getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY)?.refreshRate ?: 60f
                   }
                   val stats = { i: Float, o: Float -> main.post { updateFps(i, o) }; Unit }
-                  val p = FramePipeline(holder.surface, w, h, cw, ch, multiplier, hz, stats) { cap ->
+                  val p = FramePipeline(holder.surface, w, h, cw, ch, multiplier, maxRefreshRate(), hz, stats) { cap ->
                       main.post { attachCapture(cap, cw, ch) }
                   }
                   pipeline = p
